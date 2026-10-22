@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -308,5 +309,120 @@ func TestHandleCancel_InvalidID(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestHandleExecute_RejectsUnknownChecker(t *testing.T) {
+	judgeSrv := fakeJudgeServer(t, "1.13.0")
+	judge := sandbox.NewClient(judgeSrv.URL, "test-token")
+	_, rdb := newTestRedis(t)
+
+	submitStream := queue.NewStream(rdb, "ac:submissions:submit", "workers")
+	runStream := queue.NewStream(rdb, "ac:submissions:run", "workers")
+	h := NewHandler(nil, submitStream, runStream, queue.NewPubSub(rdb), judge, rdb, nil, nil, 5000, 8)
+
+	body := `{"language":"python","source_code":"print(1)","checker":"regex","tests":[{"input":"","expected_output":"1"}]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/execute", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	h.HandleExecute(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body %q: %v", rec.Body.String(), err)
+	}
+	if resp.Error != "checker must be one of: exact, token, float" {
+		t.Errorf("error = %q", resp.Error)
+	}
+}
+
+const legacyModeError = "mode=submit and problem_version_id are no longer supported; send tests in the request body"
+
+// assertLegacyRejected posts body and checks for the legacy-field 400 with nothing enqueued.
+func assertLegacyRejected(t *testing.T, body string) {
+	t.Helper()
+	judgeSrv := fakeJudgeServer(t, "1.13.0")
+	judge := sandbox.NewClient(judgeSrv.URL, "test-token")
+	_, rdb := newTestRedis(t)
+
+	submitStream := queue.NewStream(rdb, "ac:submissions:submit", "workers")
+	runStream := queue.NewStream(rdb, "ac:submissions:run", "workers")
+	h := NewHandler(nil, submitStream, runStream, queue.NewPubSub(rdb), judge, rdb, nil, nil, 5000, 8)
+
+	rec := postExecute(h, body)
+	assertExecuteError(t, rec, http.StatusBadRequest, legacyModeError)
+
+	for _, s := range []*queue.Stream{submitStream, runStream} {
+		if n, _ := rdb.XLen(context.Background(), s.StreamName()).Result(); n != 0 {
+			t.Errorf("XLen(%s) = %d, want 0", s.StreamName(), n)
+		}
+	}
+}
+
+func TestHandleExecute_LegacySubmitPayloadRejected(t *testing.T) {
+	assertLegacyRejected(t, `{"language":"python","source_code":"print(1)","mode":"submit","problem_version_id":"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"}`)
+}
+
+func TestHandleExecute_LegacySubmitWithTestsRejected(t *testing.T) {
+	assertLegacyRejected(t, `{"language":"python","source_code":"print(1)","mode":"submit","problem_version_id":"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b","tests":[{"input":"","expected_output":"1"}]}`)
+}
+
+func TestHandleExecute_ProblemVersionIDAloneRejected(t *testing.T) {
+	assertLegacyRejected(t, `{"language":"python","source_code":"print(1)","problem_version_id":"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b","tests":[{"input":"","expected_output":"1"}]}`)
+}
+
+func TestHandleExecute_ModeRunIsNotRejectedAsLegacy(t *testing.T) {
+	judgeSrv := fakeJudgeServer(t, "1.13.0")
+	judge := sandbox.NewClient(judgeSrv.URL, "test-token")
+	_, rdb := newTestRedis(t)
+
+	submitStream := queue.NewStream(rdb, "ac:submissions:submit", "workers")
+	runStream := queue.NewStream(rdb, "ac:submissions:run", "workers")
+	h := NewHandler(nil, submitStream, runStream, queue.NewPubSub(rdb), judge, rdb, nil, nil, 5000, 8)
+
+	// Passes the legacy gate and fails on the next validation step.
+	rec := postExecute(h, `{"language":"python","source_code":"print(1)","mode":"run"}`)
+	assertExecuteError(t, rec, http.StatusBadRequest, "at least one test is required")
+}
+
+func TestHandleExecute_RequiresTests(t *testing.T) {
+	judgeSrv := fakeJudgeServer(t, "1.13.0")
+	judge := sandbox.NewClient(judgeSrv.URL, "test-token")
+	_, rdb := newTestRedis(t)
+
+	submitStream := queue.NewStream(rdb, "ac:submissions:submit", "workers")
+	runStream := queue.NewStream(rdb, "ac:submissions:run", "workers")
+	h := NewHandler(nil, submitStream, runStream, queue.NewPubSub(rdb), judge, rdb, nil, nil, 5000, 8)
+
+	rec := postExecute(h, `{"language":"python","source_code":"print(1)"}`)
+	assertExecuteError(t, rec, http.StatusBadRequest, "at least one test is required")
+}
+
+func postExecute(h *Handler, body string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/execute", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	h.HandleExecute(rec, req)
+	return rec
+}
+
+func assertExecuteError(t *testing.T, rec *httptest.ResponseRecorder, code int, msg string) {
+	t.Helper()
+	if rec.Code != code {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, code, rec.Body.String())
+	}
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body %q: %v", rec.Body.String(), err)
+	}
+	if resp.Error != msg {
+		t.Errorf("error = %q, want %q", resp.Error, msg)
 	}
 }

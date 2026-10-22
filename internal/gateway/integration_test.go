@@ -20,19 +20,26 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/google/uuid"
+	goredis "github.com/redis/go-redis/v9"
+
+	"github.com/stjosephsplacements/AetherCode-Execution-Engine/internal/auth"
+	"github.com/stjosephsplacements/AetherCode-Execution-Engine/internal/db"
 	"github.com/stjosephsplacements/AetherCode-Execution-Engine/internal/eventlog"
+	"github.com/stjosephsplacements/AetherCode-Execution-Engine/internal/model"
 	"github.com/stjosephsplacements/AetherCode-Execution-Engine/internal/queue"
+	"github.com/stjosephsplacements/AetherCode-Execution-Engine/internal/ratelimit"
 	"github.com/stjosephsplacements/AetherCode-Execution-Engine/internal/sandbox"
 	"github.com/stjosephsplacements/AetherCode-Execution-Engine/internal/worker"
 )
 
-// These tests drive the full run-mode lifecycle in-process:
+// These tests drive the full execution lifecycle in-process:
 // POST /api/v1/execute → Redis enqueue → worker → go-judge → SSE VERDICT.
 // Redis is miniredis, go-judge is an httptest mock, and PostgreSQL is a tiny
 // wire-protocol fake, so neither Docker nor a live stack is needed.
 
-func TestExecuteAndStream_RunMode_Accepted(t *testing.T) {
-	verdict := executeAndStream(t, "3")
+func TestExecuteAndStream_Accepted(t *testing.T) {
+	verdict := executeAndStream(t, runBody("3", ""))
 
 	if got := verdict["verdict"]; got != "accepted" {
 		t.Errorf("verdict = %v, want accepted", got)
@@ -42,8 +49,8 @@ func TestExecuteAndStream_RunMode_Accepted(t *testing.T) {
 	}
 }
 
-func TestExecuteAndStream_RunMode_WrongAnswer(t *testing.T) {
-	verdict := executeAndStream(t, "4")
+func TestExecuteAndStream_WrongAnswer(t *testing.T) {
+	verdict := executeAndStream(t, runBody("4", ""))
 
 	if got := verdict["verdict"]; got != "wrong_answer" {
 		t.Errorf("verdict = %v, want wrong_answer", got)
@@ -53,14 +60,35 @@ func TestExecuteAndStream_RunMode_WrongAnswer(t *testing.T) {
 	}
 }
 
-// executeAndStream submits a single-test python run job whose expected output
-// is expectedOutput (the mock judge always prints "3"), streams it over SSE,
+func TestExecuteAndStream_FloatChecker(t *testing.T) {
+	// The mock judge prints "3": within 1e-6 of 3.0000001, but not an exact match.
+	verdict := executeAndStream(t, runBody("3.0000001", "float"))
+	if got := verdict["verdict"]; got != "accepted" {
+		t.Errorf("float checker: verdict = %v, want accepted", got)
+	}
+
+	verdict = executeAndStream(t, runBody("3.0000001", ""))
+	if got := verdict["verdict"]; got != "wrong_answer" {
+		t.Errorf("default checker: verdict = %v, want wrong_answer", got)
+	}
+}
+
+// runBody builds a single-test python run request; an empty checker omits the field.
+func runBody(expectedOutput, checker string) string {
+	c := ""
+	if checker != "" {
+		c = fmt.Sprintf(`"checker":%q,`, checker)
+	}
+	return fmt.Sprintf(`{"language":"python","source_code":"print(1+2)",%s"tests":[{"input":"","expected_output":%q}]}`, c, expectedOutput)
+}
+
+// executeAndStream POSTs body (a request for a single python test) to /execute
+// against a mock judge that always prints "3", streams it over SSE,
 // and returns the VERDICT event's data after checking the event sequence.
-func executeAndStream(t *testing.T, expectedOutput string) map[string]any {
+func executeAndStream(t *testing.T, body string) map[string]any {
 	t.Helper()
 	baseURL, releaseJudge := startExecutionStack(t)
 
-	body := fmt.Sprintf(`{"language":"python","source_code":"print(1+2)","mode":"run","tests":[{"input":"","expected_output":%q}]}`, expectedOutput)
 	resp, err := http.Post(baseURL+"/api/v1/execute", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST /execute: %v", err)
@@ -189,6 +217,25 @@ func readSSE(ctx context.Context, r io.Reader, out chan<- eventlog.Event) {
 // that unblocks the judge's /run response.
 func startExecutionStack(t *testing.T) (string, func()) {
 	t.Helper()
+	st := startStack(t, stackOptions{})
+	return st.baseURL, st.releaseJudge
+}
+
+// stackOptions tweaks the stack built by startStack.
+type stackOptions struct {
+	wrap    func(http.Handler) http.Handler // wraps the gateway mux (e.g. to inject an identity)
+	limiter *ratelimit.Limiter              // per-user limiter; required for authenticated callers
+}
+
+type stack struct {
+	baseURL      string
+	releaseJudge func()
+	rdb          *goredis.Client
+	pool         *pgxpool.Pool
+}
+
+func startStack(t *testing.T, opts stackOptions) *stack {
+	t.Helper()
 
 	pool := newFakePGPool(t)
 	_, rdb := newTestRedis(t)
@@ -209,8 +256,12 @@ func startExecutionStack(t *testing.T) (string, func()) {
 	ps := queue.NewPubSub(rdb)
 
 	mux := http.NewServeMux()
-	NewHandler(pool, submitStream, runStream, ps, judge, rdb, nil, nil, 5000, 1).Register(mux)
-	gw := httptest.NewServer(mux)
+	NewHandler(pool, submitStream, runStream, ps, judge, rdb, opts.limiter, nil, 5000, 1).Register(mux)
+	var root http.Handler = mux
+	if opts.wrap != nil {
+		root = opts.wrap(mux)
+	}
+	gw := httptest.NewServer(root)
 	t.Cleanup(func() {
 		gw.Close()
 		ps.Wait()
@@ -224,7 +275,86 @@ func startExecutionStack(t *testing.T) (string, func()) {
 		wg.Wait()
 	})
 
-	return gw.URL, releaseJudge
+	return &stack{baseURL: gw.URL, releaseJudge: releaseJudge, rdb: rdb, pool: pool}
+}
+
+func TestExecute_AuthenticatedCallerGetsStreamToken(t *testing.T) {
+	_, rdb := newTestRedis(t)
+	userID := uuid.New()
+	st := startStack(t, stackOptions{
+		limiter: ratelimit.New(rdb, 1000, 1000),
+		wrap: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ctx := auth.WithIdentity(r.Context(), auth.Identity{TenantID: model.DefaultTenantID, UserID: userID})
+				next.ServeHTTP(w, r.WithContext(ctx))
+			})
+		},
+	})
+
+	resp, err := http.Post(st.baseURL+"/api/v1/execute", "application/json", strings.NewReader(runBody("3", "")))
+	if err != nil {
+		t.Fatalf("POST /execute: %v", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // best-effort: test response body
+	if resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 201: %s", resp.StatusCode, b)
+	}
+	var exec executeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&exec); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if exec.StreamToken == "" {
+		t.Error("authenticated caller got no stream_token")
+	}
+	n, err := st.rdb.XLen(context.Background(), "ac:submissions:run").Result()
+	if err != nil || n == 0 {
+		t.Errorf("XLen(ac:submissions:run) = %d, %v; want non-zero", n, err)
+	}
+}
+
+func TestHandleCancel_UnauthRequiresStreamToken(t *testing.T) {
+	st := startStack(t, stackOptions{})
+
+	resp, err := http.Post(st.baseURL+"/api/v1/execute", "application/json", strings.NewReader(runBody("3", "")))
+	if err != nil {
+		t.Fatalf("POST /execute: %v", err)
+	}
+	var exec executeResponse
+	err = json.NewDecoder(resp.Body).Decode(&exec)
+	_ = resp.Body.Close()
+	if err != nil || exec.JobID == "" || exec.StreamToken == "" {
+		t.Fatalf("execute response: %+v, %v", exec, err)
+	}
+
+	cancelURL := st.baseURL + "/api/v1/submissions/" + exec.JobID
+	del := func(u string) (int, string) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodDelete, u, nil)
+		if err != nil {
+			t.Fatalf("build DELETE: %v", err)
+		}
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("DELETE: %v", err)
+		}
+		defer r.Body.Close() //nolint:errcheck // best-effort: test response body
+		b, _ := io.ReadAll(r.Body)
+		return r.StatusCode, string(b)
+	}
+
+	code, body := del(cancelURL)
+	if code != http.StatusUnauthorized || !strings.Contains(body, "invalid or missing stream_token") {
+		t.Errorf("no token: status = %d body = %s, want 401 invalid or missing stream_token", code, body)
+	}
+
+	// The worker may already have claimed the job, so 200 and 409 are both correct.
+	code, body = del(cancelURL + "?stream_token=" + url.QueryEscape(exec.StreamToken))
+	if code == http.StatusUnauthorized {
+		t.Errorf("valid token: status = 401, body = %s", body)
+	}
+	if code != http.StatusOK && code != http.StatusConflict {
+		t.Errorf("valid token: status = %d, want 200 or 409: %s", code, body)
+	}
 }
 
 // mockRunJudge stands in for go-judge. POST /run holds its canned single-test
@@ -253,7 +383,7 @@ func mockRunJudge(t *testing.T, release <-chan struct{}) *httptest.Server {
 // --- fake PostgreSQL ---
 
 // fakePG speaks just enough of the PostgreSQL wire protocol to serve the
-// submission statements the gateway and worker issue on the run-mode path,
+// submission statements the gateway and worker issue on the execute path,
 // backed by an in-memory table. The pool uses QueryExecModeExec, so every
 // statement is a single Parse/Bind/Describe/Execute/Sync round trip with
 // text-format parameters and results.
@@ -267,7 +397,7 @@ var submissionColumns = []struct {
 	oid  uint32
 }{
 	{"id", pgtype.UUIDOID}, {"tenant_id", pgtype.UUIDOID}, {"user_id", pgtype.UUIDOID},
-	{"problem_version_id", pgtype.UUIDOID}, {"idempotency_key", pgtype.TextOID}, {"mode", pgtype.TextOID},
+	{"idempotency_key", pgtype.TextOID},
 	{"language", pgtype.TextOID}, {"source_code", pgtype.TextOID}, {"status", pgtype.TextOID},
 	{"verdict", pgtype.TextOID}, {"compile_stderr", pgtype.TextOID}, {"cpu_time_ns", pgtype.Int8OID},
 	{"memory_bytes", pgtype.Int8OID}, {"test_count", pgtype.Int4OID}, {"tests_passed", pgtype.Int4OID},
@@ -276,7 +406,7 @@ var submissionColumns = []struct {
 
 // Columns bound by each write, in $1..$n order.
 var (
-	insertColumns  = []string{"id", "tenant_id", "user_id", "problem_version_id", "idempotency_key", "mode", "language", "source_code", "status"}
+	insertColumns  = []string{"id", "tenant_id", "user_id", "idempotency_key", "language", "source_code", "status"}
 	verdictColumns = []string{"id", "status", "verdict", "compile_stderr", "cpu_time_ns", "memory_bytes", "test_count", "tests_passed"}
 )
 
@@ -447,6 +577,15 @@ func (f *fakePG) exec(sql string, params [][]byte) (rows [][][]byte, tag string,
 	case strings.HasPrefix(sql, "UPDATE submissions SET status = $2, verdict = $3,"):
 		return nil, f.updateNonTerminal(params, verdictColumns), nil
 
+	case strings.HasPrefix(sql, "UPDATE submissions SET status = 'failed', verdict = 'cancelled'"):
+		row, ok := f.rows[string(params[0])]
+		if !ok || string(row["status"]) != "queued" {
+			return nil, "UPDATE 0", nil
+		}
+		row["status"] = []byte("failed")
+		row["verdict"] = []byte("cancelled")
+		return nil, "UPDATE 1", nil
+
 	case strings.HasPrefix(sql, "INSERT INTO submission_test_results "):
 		return nil, "INSERT 0 1", nil
 	}
@@ -467,4 +606,69 @@ func (f *fakePG) updateNonTerminal(params [][]byte, cols []string) string {
 		row[cols[i]] = params[i]
 	}
 	return "UPDATE 1"
+}
+
+// A job enqueued by an older release (submit stream, problem-bank tests, no
+// ac:tests: hash) must fail cleanly instead of hanging or panicking.
+func TestInFlightLegacySubmitJob_FailsCleanly(t *testing.T) {
+	st := startStack(t, stackOptions{})
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	jobID := uuid.New()
+	if err := db.InsertSubmission(ctx, st.pool, &model.Submission{
+		ID:         jobID,
+		TenantID:   model.DefaultTenantID,
+		Language:   "python",
+		SourceCode: "print(3)",
+		Status:     model.StatusQueued,
+	}); err != nil {
+		t.Fatalf("insert submission: %v", err)
+	}
+	token, err := newStreamToken(ctx, st.rdb, jobID.String())
+	if err != nil {
+		t.Fatalf("stream token: %v", err)
+	}
+	if err := st.rdb.XAdd(ctx, &goredis.XAddArgs{
+		Stream: "ac:submissions:submit",
+		Values: map[string]any{"submission_id": jobID.String()},
+	}).Err(); err != nil {
+		t.Fatalf("XAdd: %v", err)
+	}
+
+	q := url.Values{"job_id": {jobID.String()}, "stream_token": {token}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, st.baseURL+"/api/v1/stream?"+q.Encode(), nil)
+	if err != nil {
+		t.Fatalf("build stream request: %v", err)
+	}
+	stream, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /stream: %v", err)
+	}
+	defer stream.Body.Close() //nolint:errcheck // best-effort: test response body
+	if stream.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(stream.Body)
+		t.Fatalf("GET /stream status = %d, want 200: %s", stream.StatusCode, b)
+	}
+
+	events := make(chan eventlog.Event, 16)
+	go readSSE(ctx, stream.Body, events)
+	for {
+		select {
+		case evt, ok := <-events:
+			if !ok {
+				t.Fatal("stream closed before VERDICT")
+			}
+			if evt.Type != eventlog.EventVerdict {
+				continue
+			}
+			data, _ := evt.Data.(map[string]any)
+			if got := data["verdict"]; got != "internal_error" {
+				t.Errorf("verdict = %v, want internal_error", got)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatal("no VERDICT within 10s")
+		}
+	}
 }
