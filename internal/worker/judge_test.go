@@ -29,8 +29,8 @@ func TestJudgeOutput(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := JudgeOutput(c.expected, c.actual); got != c.want {
-				t.Fatalf("JudgeOutput(%q, %q) = %q, want %q", c.expected, c.actual, got, c.want)
+			if got := JudgeOutput("exact", c.expected, c.actual); got != c.want {
+				t.Fatalf("JudgeOutput(exact, %q, %q) = %q, want %q", c.expected, c.actual, got, c.want)
 			}
 		})
 	}
@@ -54,11 +54,62 @@ func TestNormalizeOutput(t *testing.T) {
 }
 
 func TestJudgeOutputNormalizesCarriageReturns(t *testing.T) {
-	if JudgeOutput("1\n2\n", "1\r\n2\r\n") != model.VerdictAccepted {
+	if JudgeOutput("exact", "1\n2\n", "1\r\n2\r\n") != model.VerdictAccepted {
 		t.Fatal("CRLF output should match LF expected")
 	}
-	if JudgeOutput("1\n2", "1\r2") != model.VerdictAccepted {
+	if JudgeOutput("exact", "1\n2", "1\r2") != model.VerdictAccepted {
 		t.Fatal("lone CR should count as a line break")
+	}
+}
+
+func TestJudgeToken(t *testing.T) {
+	cases := []struct {
+		name     string
+		expected string
+		actual   string
+		want     model.Verdict
+	}{
+		{"exact same", "1 2 3", "1 2 3", model.VerdictAccepted},
+		{"extra whitespace in actual", "1 2 3", "1  2  3", model.VerdictAccepted},
+		{"extra newlines", "1\n2\n3\n", "1 2 3", model.VerdictAccepted},
+		{"mixed whitespace", "hello\tworld", "hello world", model.VerdictAccepted},
+		{"wrong token", "1 2 3", "1 2 4", model.VerdictWrongAnswer},
+		{"too few tokens", "1 2 3", "1 2", model.VerdictWrongAnswer},
+		{"too many tokens", "1 2", "1 2 3", model.VerdictWrongAnswer},
+		{"empty both", "", "", model.VerdictAccepted},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := JudgeOutput("token", c.expected, c.actual); got != c.want {
+				t.Fatalf("JudgeOutput(token, %q, %q) = %q, want %q", c.expected, c.actual, got, c.want)
+			}
+		})
+	}
+}
+
+func TestJudgeFloat(t *testing.T) {
+	cases := []struct {
+		name     string
+		expected string
+		actual   string
+		want     model.Verdict
+	}{
+		{"exact float", "3.14", "3.14", model.VerdictAccepted},
+		{"within epsilon", "1.0", "1.0000001", model.VerdictAccepted},
+		{"outside epsilon", "1.0", "1.01", model.VerdictWrongAnswer},
+		{"multiple floats pass", "1.0 2.0 3.0", "1.0 2.0 3.0", model.VerdictAccepted},
+		{"multiple floats one fails", "1.0 2.0", "1.0 3.0", model.VerdictWrongAnswer},
+		{"non-float exact match", "YES", "YES", model.VerdictAccepted},
+		{"non-float mismatch", "YES", "NO", model.VerdictWrongAnswer},
+		{"token count mismatch", "1.0 2.0", "1.0", model.VerdictWrongAnswer},
+		{"negative numbers", "-1.5", "-1.5", model.VerdictAccepted},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := JudgeOutput("float", c.expected, c.actual); got != c.want {
+				t.Fatalf("JudgeOutput(float, %q, %q) = %q, want %q", c.expected, c.actual, got, c.want)
+			}
+		})
 	}
 }
 

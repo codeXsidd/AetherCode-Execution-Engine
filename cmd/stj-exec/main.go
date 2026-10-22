@@ -8,12 +8,13 @@ import (
 	"net/http/pprof"
 	"runtime/debug"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -45,6 +46,10 @@ func main() {
 		logHandler = slog.NewJSONHandler(os.Stderr, logOpts)
 	}
 	slog.SetDefault(slog.New(logHandler))
+
+	// Apply sandbox output size limits.
+	sandbox.StdoutMax = cfg.SandboxStdoutMaxBytes
+	sandbox.StderrMax = cfg.SandboxStderrMaxBytes
 
 	// Apply Go runtime tuning before any goroutines are spawned.
 	prev := debug.SetGCPercent(cfg.GOGC)
@@ -135,22 +140,38 @@ func main() {
 	bgWg.Add(1)
 	go func() {
 		defer bgWg.Done()
-		reapOrphans(ctx, pool, submitStream, runStream)
+		reapOrphans(ctx, pool, runStream)
 	}()
 
-	// Rate limiter
+	// Rate limiters
 	rl := ratelimit.New(rdb, cfg.RateLimitPerMinute, cfg.RateLimitBurst)
+	var unauthRL *ratelimit.Limiter
+	if cfg.RateLimitUnauthPerMinute > 0 {
+		unauthRL = ratelimit.New(rdb, cfg.RateLimitUnauthPerMinute, cfg.RateLimitUnauthBurst)
+		slog.Info("unauth IP rate limiting enabled", "per_minute", cfg.RateLimitUnauthPerMinute, "burst", cfg.RateLimitUnauthBurst)
+	}
 
 	// HTTP Gateway
 	mux := http.NewServeMux()
-	h := gateway.NewHandler(pool, submitStream, runStream, pubsub, judge, rdb, rl, cfg.AdmissionMaxQueueDepth, cfg.WorkerCount)
+	h := gateway.NewHandler(pool, submitStream, runStream, pubsub, judge, rdb, rl, unauthRL, cfg.AdmissionMaxQueueDepth, cfg.WorkerCount)
 	h.Register(mux)
 
 	var handler http.Handler = mux
 
 	// Auth (innermost — runs closest to the handler)
 	if cfg.AuthEnabled {
-		authMw, err := auth.NewMiddleware(cfg.OIDCIssuer, cfg.OIDCJWKSURL, cfg.OIDCAudience, pool)
+		var appPool *pgxpool.Pool
+		if cfg.DatabaseAppURL != "" {
+			var appErr error
+			appPool, appErr = db.ConnectAppRole(ctx, cfg.DatabaseAppURL)
+			if appErr != nil {
+				slog.Error("app-role database connection failed", "err", appErr)
+				os.Exit(1)
+			}
+			defer appPool.Close()
+			slog.Info("app-role pool connected (RLS active)", "url_prefix", cfg.DatabaseAppURL[:min(len(cfg.DatabaseAppURL), 30)])
+		}
+		authMw, err := auth.NewMiddleware(cfg.OIDCIssuer, cfg.OIDCJWKSURL, cfg.OIDCAudience, pool, appPool)
 		if err != nil {
 			slog.Error("auth middleware init failed", "err", err)
 			os.Exit(1)
@@ -262,7 +283,7 @@ func parseLogLevel(s string) slog.Level {
 	}
 }
 
-func reapOrphans(ctx context.Context, pool *pgxpool.Pool, submitStream, runStream *queue.Stream) {
+func reapOrphans(ctx context.Context, pool *pgxpool.Pool, runStream *queue.Stream) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -277,19 +298,15 @@ func reapOrphans(ctx context.Context, pool *pgxpool.Pool, submitStream, runStrea
 				}
 				continue
 			}
-			for _, sub := range orphans {
-				target := runStream
-				if sub.Mode == "submit" {
-					target = submitStream
-				}
-				if err := target.Enqueue(ctx, sub.ID.String()); err != nil {
-					slog.Error("orphan reaper: re-enqueue failed", "submission_id", sub.ID, "err", err)
+			for _, id := range orphans {
+				if err := runStream.Enqueue(ctx, id.String()); err != nil {
+					slog.Error("orphan reaper: re-enqueue failed", "submission_id", id, "err", err)
 					continue
 				}
-				if err := db.TouchSubmissionUpdatedAt(ctx, pool, sub.ID); err != nil {
-					slog.Error("orphan reaper: touch updated_at failed", "submission_id", sub.ID, "err", err)
+				if err := db.TouchSubmissionUpdatedAt(ctx, pool, id); err != nil {
+					slog.Error("orphan reaper: touch updated_at failed", "submission_id", id, "err", err)
 				}
-				slog.Warn("orphan reaper: re-enqueued stuck submission", "submission_id", sub.ID, "mode", sub.Mode)
+				slog.Warn("orphan reaper: re-enqueued stuck submission", "submission_id", id)
 			}
 		}
 	}

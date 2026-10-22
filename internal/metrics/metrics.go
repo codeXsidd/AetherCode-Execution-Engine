@@ -25,12 +25,19 @@ var (
 		Help:      "Total jobs processed by verdict.",
 	}, []string{"verdict"})
 
-	JobProcessingDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+	JobProcessingDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "ac",
 		Name:      "job_processing_duration_seconds",
 		Help:      "Time from dequeue to verdict in seconds.",
 		Buckets:   []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 90},
-	})
+	}, []string{"language", "verdict"})
+
+	CompileDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "ac",
+		Name:      "compile_duration_seconds",
+		Help:      "Time spent in the compilation step per language.",
+		Buckets:   []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 90},
+	}, []string{"language"})
 
 	ActiveWorkers = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: "ac",
@@ -54,5 +61,17 @@ var (
 		Namespace: "ac",
 		Name:      "poison_messages_total",
 		Help:      "Messages dead-lettered after exceeding max delivery count.",
+	})
+
+	CompileCacheHitsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "ac",
+		Name:      "compile_cache_hits_total",
+		Help:      "Compile cache hits — source was found in cache, skipping recompilation.",
+	})
+
+	CompileCacheMissesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "ac",
+		Name:      "compile_cache_misses_total",
+		Help:      "Compile cache misses — source was not in cache, compilation required.",
 	})
 )

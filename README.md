@@ -8,7 +8,7 @@ On-premise distributed code execution engine. Accepts code submissions over HTTP
 
 ![CI](https://github.com/stjosephsplacements/AetherCode-Execution-Engine/actions/workflows/ci.yml/badge.svg)
 ![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)
-![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
 
 **Status:** Production-hardened. Zero lost jobs verified at 5,000 concurrent connections / 15,000 submissions.
@@ -40,7 +40,7 @@ On-premise distributed code execution engine. Accepts code submissions over HTTP
 
 | Component | Version | Notes |
 |---|---|---|
-| Go | 1.25+ | Build toolchain |
+| Go | 1.27+ | Build toolchain |
 | PostgreSQL | 18 | Dedicated instance on `:5433` |
 | Redis | 7+ | On `127.0.0.1:6379` |
 | go-judge | v1.13.0 | Sandbox engine on `127.0.0.1:5050` |
@@ -81,7 +81,7 @@ cp deploy/env.example /etc/aethercode-exec/env
 curl http://127.0.0.1:5100/api/v1/health
 
 # End-to-end test (all languages, all verdicts)
-bash scripts/test_e2e.sh
+bash scripts/smoke_test.sh  # requires a running stack
 
 # Load test
 go build -o /tmp/loadgen ./cmd/loadgen
@@ -104,7 +104,7 @@ sudo systemctl enable --now aethercode-exec
   <img src="Architecture.png" alt="AetherCode Execution Engine — system architecture" width="100%">
 </p>
 
-### Hot path (run mode)
+### Hot path
 
 1. `POST /api/v1/execute` — gateway validates, inserts PG row, stores tests + publishes QUEUED event + enqueues in a single Redis pipeline.
 2. `GET /api/v1/stream?job_id=…` — client subscribes to SSE. Gateway subscribes to Redis pub/sub **first**, then replays event log (subscribe-before-replay prevents a race).
@@ -114,7 +114,7 @@ sudo systemctl enable --now aethercode-exec
 
 ### Fair queuing
 
-Two Redis streams: `ac:submissions:submit` (graded problems) and `ac:submissions:run` (IDE mode). `DualConsumer` reads 3 submit messages for every 1 run message, preventing IDE traffic from starving grading during contests.
+The gateway enqueues every job on `ac:submissions:run`. `ac:submissions:submit` is still consumed: `DualConsumer` reads 3 submit messages for every 1 run message.
 
 ### Reliability
 
@@ -150,8 +150,8 @@ All configuration is via environment variables. Copy `deploy/env.example` as a s
 | `AC_SUBMIT_WEIGHT` | `3` | Submit-stream priority weight vs run-stream |
 | `AC_CORS_ALLOWED_ORIGINS` | *(empty = CORS disabled)* | Comma-separated allowed origins |
 | `AC_STREAM_NAME` | `ac:submissions` | Legacy stream (drained on startup, then unused) |
-| `AC_SUBMIT_STREAM` | `ac:submissions:submit` | Submit-mode stream key |
-| `AC_RUN_STREAM` | `ac:submissions:run` | Run-mode stream key |
+| `AC_SUBMIT_STREAM` | `ac:submissions:submit` | Submit stream key (still consumed; the gateway no longer enqueues to it) |
+| `AC_RUN_STREAM` | `ac:submissions:run` | Stream the gateway enqueues every job on |
 | `AC_CONSUMER_GROUP` | `workers` | Redis consumer group name |
 
 ### Production checklist
@@ -179,7 +179,7 @@ Submit code for execution.
 | Header | Required | Description |
 |---|---|---|
 | `Content-Type` | Yes | Must be `application/json` |
-| `Authorization` | Conditional | `Bearer <token>` — required when auth is enabled and mode is `submit` |
+| `Authorization` | Conditional | `Bearer <token>` — optional; identifies the caller (per-user rate limiting, stream/cancel ownership) |
 | `Idempotency-Key` | No | Deduplicate retries (any string, max 255 chars) |
 
 **Request body**
@@ -188,7 +188,6 @@ Submit code for execution.
 {
   "language": "python",
   "source_code": "n=int(input())\nprint(n*2)",
-  "mode": "run",
   "tests": [
     { "input": "21\n", "expected_output": "42\n" }
   ]
@@ -199,26 +198,27 @@ Submit code for execution.
 |---|---|---|---|
 | `language` | string | Yes | See [Supported Languages](#supported-languages) |
 | `source_code` | string | Yes | Max 64 KB |
-| `mode` | string | No | `"run"` (default) or `"submit"` |
-| `tests` | array | For `run` mode | Max 100 tests; each input/expected_output max 8 MB (request body max 64 MB) |
-| `time_limit_ms` | integer | No | Run mode: CPU time limit per test, 100–20000 (default: language default, 2 s) |
-| `memory_limit_kb` | integer | No | Run mode: memory limit per test, 16384–2097152 (default 512 MB; Java never below 256 MB) |
-| `problem_version_id` | string (UUID) | For `submit` mode | Server-side test suite to grade against |
-| `idempotency_key` | string | No | Client-chosen key; same key + user + mode returns the original job ID |
+| `tests` | array | Yes | Max 100 tests; each input/expected_output max 8 MB (request body max 64 MB) |
+| `checker` | string | No | `"exact"` (default; trailing whitespace and CRLF normalised), `"token"` (whitespace-separated tokens) or `"float"` (numeric tokens within an absolute 1e-6) |
+| `mode`, `problem_version_id` | — | Rejected | Legacy submit-mode fields are rejected with `400`; send `tests` instead. Only `"mode":"run"` is tolerated for compatibility |
+| `time_limit_ms` | integer | No | CPU time limit per test, 100–20000 (default: language default, 2 s) |
+| `memory_limit_kb` | integer | No | Memory limit per test, 16384–2097152 (default 512 MB; Java never below 256 MB) |
+| `idempotency_key` | string | No | Client-chosen key; same key + user returns the original job ID |
 
 **Response `201 Created`**
 
 ```json
-{ "job_id": "019741b2-3c1a-7d4e-8f0a-1234567890ab" }
+{ "job_id": "019741b2-3c1a-7d4e-8f0a-1234567890ab", "stream_token": "dGhpcyBpcyBhIHRlc3Q" }
 ```
+
+`stream_token` is issued for every new job. Unauthenticated callers must pass it as `?stream_token=` to `GET /api/v1/stream` and `DELETE /api/v1/submissions/{id}`.
 
 **Error responses**
 
 | Status | Meaning |
 |---|---|
-| `400` | Invalid request (bad JSON, unsupported language, missing field) |
-| `401` | Authentication required |
-| `404` | Problem version not found |
+| `400` | Invalid request (bad JSON, unsupported language, missing field, no tests) |
+| `401` | Invalid bearer token |
 | `415` | Content-Type must be `application/json` |
 | `429` | Rate limit or queue depth exceeded — retry after `Retry-After` seconds |
 | `500` | Internal error |
@@ -296,7 +296,7 @@ data: {
 }
 ```
 
-> **Note:** In `submit` mode, `stdout_preview` and `stderr_preview` are omitted for hidden (non-sample) tests. In `run` mode each result also carries the complete `stdout` and `stderr` (previews are cut to 256 bytes), for callers that grade with their own checker.
+> **Note:** Each result carries the complete `stdout` and `stderr` (previews are cut to 256 bytes), for callers that grade with their own checker.
 
 **Verdict values**
 
@@ -333,7 +333,7 @@ queue information.
 {
   "status": "healthy",
   "version": "v0.1.0",
-  "go_version": "go1.25.0",
+  "go_version": "go1.27.2",
   "uptime_seconds": 3612,
   "checks": {
     "database": "ok",
@@ -446,26 +446,24 @@ See `docs/benchmark-results.md` for full latency breakdowns and `docs/spike-resu
 
 ## Releases
 
-Releases flow through a gated four-branch pipeline:
+Releases flow through a two-branch pipeline:
 
 ```
-development  →  testing  →  staging  →  production
+development  →  production
 ```
 
 `development` is the default branch — all work starts here.
 
 | Branch | Promotion trigger |
 |---|---|
-| `development` | CI green on a merged PR |
-| `testing` | Automatic — the CI workflow opens and merges a PR from `development` once CI is green |
-| `staging` | Automatic — same, promoted from `testing` |
-| `production` | **Human gate** — a PR is opened automatically from `staging`, but merging requires one approving review from an org member |
+| `development` | CI green on a merged PR (topic branches auto-promote here) |
+| `production` | **Human gate** — a PR is opened automatically from `development` once CI is green, but merging requires one approving review from an org member |
 
-**Topic branches** (`feat/*`, `fix/*`, `security/*`, etc.) follow the same flow: once CI is green on the topic branch, a PR is opened into `development` automatically and merged when its CI passes.
+**Topic branches** (`feature/*`, `fix/*`, `security/*`, `ci/*`, `docs/*`, `chore/*`, `refactor/*`) auto-promote: once CI is green on the topic branch, a PR is opened into `development` and merged automatically.
 
-**Merge policy:** all promotions use a standard merge commit. Squash and rebase merges are disabled to preserve a linear, auditable history across the pipeline.
+**Merge policy:** squash merges only — keeps a clean, auditable `production` history.
 
-**Dependabot** dependency updates target `development` and are auto-approved and auto-merged once their CI is green, then flow through the normal pipeline.
+**Dependabot** dependency updates target `development` and are auto-approved and auto-merged once CI is green, then flow through the normal pipeline.
 
 ---
 
@@ -481,6 +479,13 @@ norms.
 To report a vulnerability, see [SECURITY.md](SECURITY.md). The engine runs
 untrusted submissions inside a go-judge sandbox; reports about that sandbox
 boundary are especially valuable.
+
+### Sandbox Mount Configuration
+
+`docker/go-judge/mount.yaml` controls which host paths, `proc`/`sys`/`dev`
+nodes, and devices are visible inside the sandbox. Read-only entries like
+`/usr/lib` supply runtime libraries; `/home` is deliberately excluded. See the
+inline comments in that file before adding a new language runtime or device.
 
 ## License
 

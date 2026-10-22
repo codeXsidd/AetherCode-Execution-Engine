@@ -21,15 +21,18 @@ type Config struct {
 	LogFormat     string
 
 	// Auth (Zitadel OIDC)
-	AuthEnabled  bool
-	OIDCIssuer   string
-	OIDCJWKSURL  string
-	OIDCAudience string
+	AuthEnabled    bool
+	OIDCIssuer     string
+	OIDCJWKSURL    string
+	OIDCAudience   string
+	DatabaseAppURL string // optional: connects as aethercode_app for RLS-enforced auth queries
 
 	// Rate limiting
-	RateLimitPerMinute     int
-	RateLimitBurst         int
-	AdmissionMaxQueueDepth int
+	RateLimitPerMinute       int
+	RateLimitBurst           int
+	RateLimitUnauthPerMinute int // per source IP, 0 = disabled
+	RateLimitUnauthBurst     int
+	AdmissionMaxQueueDepth   int
 
 	// CORS
 	CORSAllowedOrigins string
@@ -52,8 +55,12 @@ type Config struct {
 	BlockReadTimeout time.Duration
 
 	// Go runtime tuning
-	GOGC        int
-	GOMEMLIMIT  int64
+	GOGC       int
+	GOMEMLIMIT int64
+
+	// Sandbox output limits
+	SandboxStdoutMaxBytes int64
+	SandboxStderrMaxBytes int64
 }
 
 func Load() Config {
@@ -69,14 +76,17 @@ func Load() Config {
 		LogLevel:      env("AC_LOG_LEVEL", "info"),
 		LogFormat:     env("AC_LOG_FORMAT", "json"),
 
-		AuthEnabled:  envBool("AC_AUTH_ENABLED", false),
-		OIDCIssuer:   env("AC_OIDC_ISSUER", "https://sso.example.com"),
-		OIDCJWKSURL:  env("AC_OIDC_JWKS_URL", "http://127.0.0.1:8087/oauth/v2/keys"),
-		OIDCAudience: env("AC_OIDC_AUDIENCE", ""),
+		AuthEnabled:    envBool("AC_AUTH_ENABLED", false),
+		OIDCIssuer:     env("AC_OIDC_ISSUER", "https://sso.example.com"),
+		OIDCJWKSURL:    env("AC_OIDC_JWKS_URL", "http://127.0.0.1:8087/oauth/v2/keys"),
+		OIDCAudience:   env("AC_OIDC_AUDIENCE", ""),
+		DatabaseAppURL: env("AC_DATABASE_APP_URL", ""),
 
-		RateLimitPerMinute:     envInt("AC_RATE_LIMIT_PER_MINUTE", 30),
-		RateLimitBurst:         envInt("AC_RATE_LIMIT_BURST", 10),
-		AdmissionMaxQueueDepth: envInt("AC_ADMISSION_MAX_QUEUE_DEPTH", 5000),
+		RateLimitPerMinute:       envInt("AC_RATE_LIMIT_PER_MINUTE", 30),
+		RateLimitBurst:           envInt("AC_RATE_LIMIT_BURST", 10),
+		RateLimitUnauthPerMinute: envInt("AC_RATE_LIMIT_UNAUTH_PER_MINUTE", 0),
+		RateLimitUnauthBurst:     envInt("AC_RATE_LIMIT_UNAUTH_BURST", 5),
+		AdmissionMaxQueueDepth:   envInt("AC_ADMISSION_MAX_QUEUE_DEPTH", 5000),
 
 		CORSAllowedOrigins: env("AC_CORS_ALLOWED_ORIGINS", ""),
 
@@ -92,6 +102,9 @@ func Load() Config {
 
 		GOGC:       envInt("AC_GOGC", 200),
 		GOMEMLIMIT: envInt64("AC_GOMEMLIMIT", 0),
+
+		SandboxStdoutMaxBytes: envInt64("AC_SANDBOX_STDOUT_MAX_BYTES", 8<<20),
+		SandboxStderrMaxBytes: envInt64("AC_SANDBOX_STDERR_MAX_BYTES", 1<<20),
 	}
 }
 
@@ -108,6 +121,8 @@ func (c Config) Validate() error {
 	check(c.AdmissionMaxQueueDepth > 0, "AdmissionMaxQueueDepth must be > 0")
 	check(c.RateLimitPerMinute > 0, "RateLimitPerMinute must be > 0")
 	check(c.RateLimitBurst > 0, "RateLimitBurst must be > 0")
+	check(c.RateLimitUnauthPerMinute >= 0, "RateLimitUnauthPerMinute must be >= 0")
+	check(c.RateLimitUnauthBurst > 0, "RateLimitUnauthBurst must be > 0")
 	check(c.GatewayAddr != "", "GatewayAddr is required")
 	check(c.DatabaseURL != "", "DatabaseURL is required")
 	check(c.RedisAddr != "", "RedisAddr is required")
@@ -120,6 +135,8 @@ func (c Config) Validate() error {
 	check(c.BlockReadTimeout >= 100*time.Millisecond && c.BlockReadTimeout <= 10*time.Second, "BlockReadTimeout must be 100ms-10s")
 	check(c.GOGC >= 50 && c.GOGC <= 1000, "GOGC must be 50-1000")
 	check(c.GOMEMLIMIT >= 0, "GOMEMLIMIT must be >= 0")
+	check(c.SandboxStdoutMaxBytes > 0 && c.SandboxStdoutMaxBytes <= 64<<20, "SandboxStdoutMaxBytes must be 1-67108864")
+	check(c.SandboxStderrMaxBytes > 0 && c.SandboxStderrMaxBytes <= 64<<20, "SandboxStderrMaxBytes must be 1-67108864")
 
 	if c.AuthEnabled && c.OIDCAudience == "" {
 		errs = append(errs, "OIDCAudience (AC_OIDC_AUDIENCE) is required when auth is enabled")
@@ -127,6 +144,9 @@ func (c Config) Validate() error {
 
 	if !c.AuthEnabled {
 		fmt.Fprintln(os.Stderr, "WARNING: AC_AUTH_ENABLED=false — authentication is disabled")
+	}
+	if c.AuthEnabled && c.DatabaseAppURL == "" {
+		fmt.Fprintln(os.Stderr, "WARNING: AC_DATABASE_APP_URL not set — auth queries run as DB owner, bypassing Row-Level Security")
 	}
 
 	if len(errs) > 0 {

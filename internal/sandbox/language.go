@@ -1,11 +1,15 @@
 package sandbox
 
+// StdoutMax and StderrMax are the per-test output caps sent to go-judge.
+// They default to 8 MiB and 1 MiB respectively and can be overridden at
+// startup via AC_SANDBOX_STDOUT_MAX_BYTES / AC_SANDBOX_STDERR_MAX_BYTES.
+var (
+	StdoutMax int64 = 8 << 20
+	StderrMax int64 = 1 << 20
+)
+
 const (
-	// Program output a test may produce. Exam answers can be large (e.g. 10^5
-	// numbers); go-judge itself is started with -output-limit 16m.
-	stdoutMax int64 = 8 << 20
-	stderrMax int64 = 1 << 20
-	// Compiler diagnostics stay small.
+	// Compiler diagnostics stay small — not configurable.
 	compileOutMax int64 = 64 << 10
 )
 
@@ -155,6 +159,90 @@ var Languages = map[string]LangConfig{
 		RunMem:        536_870_912,
 		RunProc:       10,
 	},
+	// --- Additional languages ---
+	"bash": {
+		Compiled:   false,
+		SourcePath: "/w/main.sh",
+		RunArgs:    []string{"/bin/bash", "/w/main.sh"},
+		RunEnv:     []string{"PATH=/usr/bin:/bin"},
+		RunCPU:     2_000_000_000,
+		RunMem:     268_435_456,
+		RunProc:    20,
+	},
+	"csharp": {
+		Compiled:    true,
+		CompileArgs: []string{"/usr/bin/mcs", "-out:/w/main.exe", "/w/Main.cs"},
+		CompileEnv:  []string{"PATH=/usr/bin:/bin"},
+		CompileCPU:  15_000_000_000,
+		CompileMem:  536_870_912,
+		CompileProc: 50,
+		SourcePath:  "/w/Main.cs",
+		BinaryPath:  "/w/main.exe",
+		RunArgs:     []string{"/usr/bin/mono", "/w/main.exe"},
+		RunEnv:      []string{"PATH=/usr/bin:/bin"},
+		RunCPU:      2_000_000_000,
+		RunMem:      536_870_912,
+		RunProc:     20,
+		MinRunMem:   134_217_728,
+	},
+	"kotlin": {
+		Compiled:    true,
+		CompileArgs: []string{"/usr/bin/kotlinc", "/w/Main.kt", "-include-runtime", "-d", "/w/Main.jar"},
+		CompileEnv:  []string{"PATH=/usr/bin:/bin", "KOTLIN_HOME=/usr/share/kotlin"},
+		CompileCPU:  20_000_000_000,
+		CompileMem:  1_073_741_824,
+		CompileProc: 50,
+		SourcePath:  "/w/Main.kt",
+		BinaryPath:  "/w/Main.jar",
+		RunArgs:     []string{"/usr/bin/java", "-jar", "/w/Main.jar"},
+		RunEnv:      []string{"PATH=/usr/bin:/bin", "JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64"},
+		RunCPU:      2_000_000_000,
+		RunMem:      536_870_912,
+		RunProc:     50,
+		MinRunMem:   268_435_456,
+	},
+	"rust": {
+		Compiled:    true,
+		CompileArgs: []string{"/usr/bin/rustc", "-O", "-o", "/w/a.out", "/w/main.rs"},
+		CompileEnv:  []string{"PATH=/usr/bin:/bin", "HOME=/tmp"},
+		CompileCPU:  20_000_000_000,
+		CompileMem:  536_870_912,
+		CompileProc: 50,
+		SourcePath:  "/w/main.rs",
+		BinaryPath:  "/w/a.out",
+		RunArgs:     []string{"/w/a.out"},
+		RunEnv:      []string{"PATH=/usr/bin:/bin"},
+		RunCPU:      2_000_000_000,
+		RunMem:      536_870_912,
+		RunProc:     10,
+	},
+	"typescript": {
+		Compiled:   false,
+		SourcePath: "/w/main.ts",
+		RunArgs:    []string{"/usr/bin/bun", "run", "/w/main.ts"},
+		RunEnv:     []string{"PATH=/usr/bin:/bin", "HOME=/tmp"},
+		RunCPU:     2_000_000_000,
+		RunMem:     536_870_912,
+		RunProc:    50,
+	},
+	"php": {
+		Compiled:   false,
+		SourcePath: "/w/main.php",
+		RunArgs:    []string{"/usr/bin/php", "/w/main.php"},
+		RunEnv:     []string{"PATH=/usr/bin:/bin", "HOME=/tmp"},
+		RunCPU:     2_000_000_000,
+		RunMem:     536_870_912,
+		RunProc:    50,
+	},
+	"ruby": {
+		Compiled:   false,
+		SourcePath: "/w/main.rb",
+		RunArgs:    []string{"/usr/bin/ruby", "/w/main.rb"},
+		RunEnv:     []string{"PATH=/usr/bin:/bin", "HOME=/tmp"},
+		RunCPU:     2_000_000_000,
+		RunMem:     536_870_912,
+		RunProc:    50,
+	},
 }
 
 // BuildCompileCmd builds the go-judge Cmd for the compilation step.
@@ -199,7 +287,7 @@ func BuildRunCmd(lang LangConfig, sourceCode, stdinData, fileID string, limits R
 	cmd := Cmd{
 		Args:        lang.RunArgs,
 		Env:         lang.RunEnv,
-		Files:       []CmdFile{Stdin(stdinData), Collector("stdout", stdoutMax), Collector("stderr", stderrMax)},
+		Files:       []CmdFile{Stdin(stdinData), Collector("stdout", StdoutMax), Collector("stderr", StderrMax)},
 		CPULimit:    cpu,
 		ClockLimit:  ClockLimit(cpu),
 		MemoryLimit: memory,

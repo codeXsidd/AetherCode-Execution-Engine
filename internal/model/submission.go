@@ -17,6 +17,7 @@ const (
 	VerdictCompilationError Verdict = "compilation_error"
 	VerdictInternalError    Verdict = "internal_error"
 	VerdictOutputLimitEx    Verdict = "output_limit"
+	VerdictCancelled        Verdict = "cancelled"
 )
 
 type Status string
@@ -29,41 +30,25 @@ const (
 	StatusFailed    Status = "failed"
 )
 
-type Mode string
-
-const (
-	ModeRun    Mode = "run"
-	ModeSubmit Mode = "submit"
-)
-
 // DefaultTenantID is the seeded default tenant UUID from migration 002.
 var DefaultTenantID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
 
 type Submission struct {
-	ID               uuid.UUID
-	TenantID         uuid.UUID
-	UserID           *uuid.UUID
-	ProblemVersionID *uuid.UUID
-	IdempotencyKey   *string
-	Mode             string
-	Language         string
-	SourceCode       string
-	Status           Status
-	Verdict          Verdict
-	CompileStderr    string
-	CPUTimeNs        int64
-	MemoryBytes      int64
-	TestCount        int
-	TestsPassed      int
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-}
-
-type TestCase struct {
-	Index          int
-	Input          string
-	ExpectedOutput string
-	IsSample       bool
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	UserID         *uuid.UUID
+	IdempotencyKey *string
+	Language       string
+	SourceCode     string
+	Status         Status
+	Verdict        Verdict
+	CompileStderr  string
+	CPUTimeNs      int64
+	MemoryBytes    int64
+	TestCount      int
+	TestsPassed    int
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type TestResult struct {
@@ -73,4 +58,21 @@ type TestResult struct {
 	MemoryBytes   int64
 	StdoutPreview string
 	StderrPreview string
+}
+
+// Output checker names accepted in execute requests.
+const (
+	CheckerExact = "exact"
+	CheckerToken = "token"
+	CheckerFloat = "float"
+)
+
+// ValidChecker reports whether s names a supported checker. The empty string
+// is valid and means exact.
+func ValidChecker(s string) bool {
+	switch s {
+	case "", CheckerExact, CheckerToken, CheckerFloat:
+		return true
+	}
+	return false
 }

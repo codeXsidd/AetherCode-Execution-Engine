@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -80,7 +82,7 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 
 		slog.Log(r.Context(), level, "http",
 			"method", r.Method,
-			"path", r.URL.Path,
+			"path", sanitizeLogValue(r.URL.Path),
 			"status", sw.status,
 			"duration_ms", duration.Milliseconds(),
 			"bytes", sw.bytes,
@@ -88,6 +90,44 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 			"request_id", reqID,
 		)
 	})
+}
+
+// remoteIP extracts the best-effort client IP for rate limiting.
+// Trusts X-Forwarded-For only to strip the rightmost proxy hop; the result
+// is used as a rate-limit key, not for authentication.
+func remoteIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// X-Forwarded-For: client, proxy1, proxy2 — take the leftmost entry
+		if idx := strings.Index(xff, ","); idx >= 0 {
+			xff = xff[:idx]
+		}
+		if ip := strings.TrimSpace(xff); ip != "" {
+			return ip
+		}
+	}
+	if xri := r.Header.Get("X-Real-Ip"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// sanitizeLogValue strips ASCII control characters (including newlines and carriage
+// returns) from user-supplied strings before they are written to structured log
+// output. This prevents log-injection attacks where a crafted path could embed
+// fake log entries or corrupt JSON log output.
+func sanitizeLogValue(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := range len(s) {
+		b := s[i]
+		if b >= 0x20 && b != 0x7f { // printable ASCII only
+			out = append(out, b)
+		}
+	}
+	return string(out)
 }
 
 var knownPaths = map[string]bool{

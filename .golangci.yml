@@ -13,6 +13,8 @@ linters:
     - ineffassign
     - bodyclose
     - gosec
+    - misspell     # catches typos in comments and strings
+    - whitespace   # trailing whitespace / unnecessary blank lines
   settings:
     errcheck:
       # Logging is intentionally fire-and-forget.
@@ -37,3 +39,15 @@ linters:
         linters:
           - gosec
           - errcheck
+
+formatters:
+  enable:
+    - goimports
+    - gofmt
+  settings:
+    goimports:
+      # Group imports: stdlib first, then external, then internal.
+      local-prefixes:
+        - github.com/stjosephsplacements/AetherCode-Execution-Engine
+    gofmt:
+      simplify: true

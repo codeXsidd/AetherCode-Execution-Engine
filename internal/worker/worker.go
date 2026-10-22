@@ -97,7 +97,7 @@ func (w *Worker) runWorker(ctx context.Context, consumer string) (panicked bool)
 type testData struct {
 	Input          string
 	ExpectedOutput string
-	IsSample       bool
+	CheckerType    string // "exact" | "token" | "float"; empty means exact
 }
 
 func (w *Worker) process(ctx context.Context, submissionID string) error {
@@ -135,10 +135,31 @@ func (w *Worker) process(ctx context.Context, submissionID string) error {
 	// Count only jobs we've actually claimed; deferred duration also starts here.
 	metrics.ActiveWorkers.Inc()
 	defer metrics.ActiveWorkers.Dec()
-	defer func() { metrics.JobProcessingDuration.Observe(time.Since(start).Seconds()) }()
+	// finalVerdict is set just before each return so the deferred histogram gets labels.
+	finalVerdict := string(model.VerdictInternalError)
+	defer func() {
+		metrics.JobProcessingDuration.WithLabelValues(sub.Language, finalVerdict).Observe(time.Since(start).Seconds())
+	}()
 
-	// Load tests from the appropriate source
-	tests, limits, err := w.loadTests(jobCtx, sub)
+	// Heartbeat — touch updated_at every 30s so the orphan reaper doesn't
+	// re-enqueue a legitimately running job before its timeout expires.
+	heartbeatCtx, heartbeatCancel := context.WithCancel(jobCtx)
+	defer heartbeatCancel()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				db.TouchSubmissionUpdatedAt(heartbeatCtx, w.pool, id) //nolint:errcheck
+			}
+		}
+	}()
+
+	// Load the job's tests and limits from Redis
+	tests, limits, err := w.loadTests(jobCtx, submissionID)
 	if err != nil {
 		return w.failSubmission(jobCtx, id, model.VerdictInternalError, fmt.Sprintf("load tests: %v", err), log)
 	}
@@ -177,15 +198,19 @@ func (w *Worker) process(ctx context.Context, submissionID string) error {
 		cacheKey := compileCacheKey(sub.Language, sub.SourceCode)
 		if cached, hit := w.cc.get(cacheKey); hit {
 			fileID = cached
+			metrics.CompileCacheHitsTotal.Inc()
 			log.Info("compile cache hit", "fileId", fileID)
 		} else {
+			compileStart := time.Now()
 			compileResult, err := w.compile(jobCtx, lang, sub.SourceCode)
+			metrics.CompileDuration.WithLabelValues(sub.Language).Observe(time.Since(compileStart).Seconds())
 			if err != nil {
 				return w.failSubmission(jobCtx, id, model.VerdictInternalError, err.Error(), log)
 			}
 
 			if compileResult.Status != sandbox.StatusAccepted {
 				stderr := compileResult.Files["stderr"]
+				finalVerdict = string(model.VerdictCompilationError)
 				return w.failSubmission(jobCtx, id, model.VerdictCompilationError, stderr, log)
 			}
 
@@ -197,6 +222,7 @@ func (w *Worker) process(ctx context.Context, submissionID string) error {
 				return w.failSubmission(jobCtx, id, model.VerdictInternalError, "no cached file returned from compile", log)
 			}
 			w.cc.put(cacheKey, fileID)
+			metrics.CompileCacheMissesTotal.Inc()
 			log.Info("compiled", "fileId", fileID)
 		}
 	}
@@ -236,90 +262,75 @@ func (w *Worker) process(ctx context.Context, submissionID string) error {
 		return fmt.Errorf("worker: write results+verdict: %w", err)
 	}
 
-	// Build verdict event data — filter hidden test output for submit mode
-	eventResults := make([]map[string]any, len(results))
-	isSubmitMode := sub.Mode == string(model.ModeSubmit)
-	for i, r := range results {
-		entry := map[string]any{
-			"test_index":   r.TestIndex,
-			"verdict":      r.Verdict,
-			"cpu_time_ns":  r.CPUTimeNs,
-			"memory_bytes": r.MemoryBytes,
-		}
-		// Only include stdout/stderr for sample tests in submit mode, or always in run mode
-		if !isSubmitMode || (i < len(tests) && tests[i].IsSample) {
-			entry["stdout_preview"] = db.Truncate(r.StdoutPreview, 256)
-			entry["stderr_preview"] = db.Truncate(r.StderrPreview, 256)
-		}
-		// Run-mode callers (an exam server grading with its own checker) need the
-		// complete output, not a preview; it is bounded by the sandbox output limit.
-		if !isSubmitMode {
-			entry["stdout"] = r.StdoutPreview
-			entry["stderr"] = r.StderrPreview
-		}
-		eventResults[i] = entry
-	}
+	eventResults := verdictResults(results)
 
+	effectiveCPU, effectiveMem := lang.Effective(limits)
 	verdictData := map[string]any{
-		"verdict":      overallVerdict,
-		"tests_passed": passed,
-		"test_count":   len(tests),
-		"cpu_time_ns":  totalCPU,
-		"memory_bytes": peakMem,
-		"results":      eventResults,
+		"verdict":                    overallVerdict,
+		"tests_passed":               passed,
+		"test_count":                 len(tests),
+		"cpu_time_ns":                totalCPU,
+		"memory_bytes":               peakMem,
+		"applied_cpu_limit_ns":       effectiveCPU,
+		"applied_memory_limit_bytes": effectiveMem,
+		"results":                    eventResults,
 	}
 	if err := w.pubsub.PublishEvent(writeCtx, eventlog.New(submissionID, eventlog.EventVerdict, verdictData)); err != nil {
 		log.Error("failed to publish VERDICT event (DB has verdict, SSE client may not)", "err", err)
 	}
 
+	finalVerdict = string(overallVerdict)
 	metrics.JobsProcessedTotal.WithLabelValues(string(overallVerdict)).Inc()
 
 	log.Info("completed", "verdict", overallVerdict, "passed", passed, "total", len(tests))
 	return nil
 }
 
-func (w *Worker) loadTests(ctx context.Context, sub *model.Submission) ([]testData, sandbox.RunLimits, error) {
-	if sub.Mode == string(model.ModeSubmit) && sub.ProblemVersionID != nil {
-		tcs, err := db.GetTestCases(ctx, w.pool, *sub.ProblemVersionID)
-		if err != nil {
-			return nil, sandbox.RunLimits{}, err
-		}
-		tests := make([]testData, len(tcs))
-		for i, tc := range tcs {
-			tests[i] = testData{
-				Input:          tc.Input,
-				ExpectedOutput: tc.ExpectedOutput,
-				IsSample:       tc.IsSample,
-			}
-		}
-		return tests, sandbox.RunLimits{}, nil
-	}
-
-	// Run mode: tests and limits from Redis
-	redisTests, limits, err := w.pubsub.GetTests(ctx, sub.ID.String())
+func (w *Worker) loadTests(ctx context.Context, jobID string) ([]testData, sandbox.RunLimits, error) {
+	set, err := w.pubsub.GetTests(ctx, jobID)
 	if err != nil {
 		return nil, sandbox.RunLimits{}, err
 	}
-	tests := make([]testData, len(redisTests))
-	for i, rt := range redisTests {
+	tests := make([]testData, len(set.Tests))
+	for i, rt := range set.Tests {
 		tests[i] = testData{
 			Input:          rt.Input,
 			ExpectedOutput: rt.ExpectedOutput,
-			IsSample:       true, // all client-supplied tests are visible
+			CheckerType:    set.Checker,
 		}
 	}
-	return tests, limits, nil
+	return tests, set.Limits, nil
+}
+
+// verdictResults builds the per-test entries of the VERDICT event. The caller
+// supplied the tests, so every test carries its full output (bounded by the
+// sandbox output limit) plus a 256-byte preview.
+func verdictResults(results []model.TestResult) []map[string]any {
+	out := make([]map[string]any, len(results))
+	for i, r := range results {
+		out[i] = map[string]any{
+			"test_index":     r.TestIndex,
+			"verdict":        r.Verdict,
+			"cpu_time_ns":    r.CPUTimeNs,
+			"memory_bytes":   r.MemoryBytes,
+			"stdout_preview": db.Truncate(r.StdoutPreview, 256),
+			"stderr_preview": db.Truncate(r.StderrPreview, 256),
+			"stdout":         r.StdoutPreview,
+			"stderr":         r.StderrPreview,
+		}
+	}
+	return out
 }
 
 // jobBudget is the worst-case time a job needs: compiling plus every test
 // running to its wall-clock limit, with slack for sandbox and DB round trips.
 func jobBudget(lang sandbox.LangConfig, limits sandbox.RunLimits, tests int) time.Duration {
 	cpu, _ := lang.Effective(limits)
-	total := sandbox.ClockLimit(cpu) * uint64(tests)
+	total := sandbox.ClockLimit(cpu) * uint64(tests) //nolint:gosec // G115: tests is a non-negative test count
 	if lang.Compiled {
 		total += sandbox.ClockLimit(lang.CompileCPU)
 	}
-	return time.Duration(total) + 15*time.Second
+	return time.Duration(total) + 15*time.Second //nolint:gosec // G115: total is a bounded ns budget, far below MaxInt64
 }
 
 func (w *Worker) compile(ctx context.Context, lang sandbox.LangConfig, sourceCode string) (*sandbox.Result, error) {
@@ -395,7 +406,7 @@ func (w *Worker) runTestsBatched(ctx context.Context, jobID string, lang sandbox
 
 		for i, r := range batchResults {
 			testIndex := batchStart + i
-			tr := judgeResult(r, testIndex, batch[i].ExpectedOutput)
+			tr := judgeResult(r, testIndex, batch[i].ExpectedOutput, batch[i].CheckerType)
 			results = append(results, tr)
 			totalCPU += tr.CPUTimeNs
 			if tr.MemoryBytes > peakMem {
@@ -423,7 +434,7 @@ func (w *Worker) runTestsBatched(ctx context.Context, jobID string, lang sandbox
 }
 
 // judgeResult converts a single go-judge sandbox.Result into a model.TestResult.
-func judgeResult(r sandbox.Result, testIndex int, expectedOutput string) model.TestResult {
+func judgeResult(r sandbox.Result, testIndex int, expectedOutput, checkerType string) model.TestResult {
 	tr := model.TestResult{
 		TestIndex:     testIndex,
 		CPUTimeNs:     int64(r.Time),   //nolint:gosec // go-judge reports CPU time in ns (non-negative)
@@ -434,7 +445,7 @@ func judgeResult(r sandbox.Result, testIndex int, expectedOutput string) model.T
 
 	switch r.Status {
 	case sandbox.StatusAccepted:
-		tr.Verdict = JudgeOutput(expectedOutput, r.Files["stdout"])
+		tr.Verdict = JudgeOutput(checkerType, expectedOutput, r.Files["stdout"])
 	case sandbox.StatusTimeLimitEx:
 		tr.Verdict = model.VerdictTimeLimitEx
 	case sandbox.StatusMemoryLimitEx:
