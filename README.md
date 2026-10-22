@@ -480,6 +480,13 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md). The engine runs
 untrusted submissions inside a go-judge sandbox; reports about that sandbox
 boundary are especially valuable.
 
+### Sandbox Mount Configuration
+
+`docker/go-judge/mount.yaml` controls which host paths, `proc`/`sys`/`dev`
+nodes, and devices are visible inside the sandbox. Read-only entries like
+`/usr/lib` supply runtime libraries; `/home` is deliberately excluded. See the
+inline comments in that file before adding a new language runtime or device.
+
 ## License
 
 This project is licensed under the
