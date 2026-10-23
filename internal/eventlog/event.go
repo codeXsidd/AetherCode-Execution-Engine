@@ -31,9 +31,7 @@ func (e Event) IsTerminal() bool {
 
 func (e Event) MarshalSSE() []byte {
 	data, _ := json.Marshal(e)
-	// Pre-size the buffer. Each component is bounded:
-	//   ID ≤ ~100 bytes (UUID + epoch + seq), Type ≤ 20 bytes, data ≤ 16 MiB (pubsub cap).
-	// Using individual appends avoids integer arithmetic that could mislead static analysis.
+	// Using individual appends avoids integer arithmetic flagged by CodeQL go/allocation-size-overflow.
 	var buf []byte
 	buf = append(buf, "id: "...)
 	buf = append(buf, e.ID...)
